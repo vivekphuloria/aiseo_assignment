@@ -1,5 +1,4 @@
 """Node 3: Build full article outline with SEO constraints and linking strategy."""
-import os
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -12,7 +11,6 @@ def _get_llm() -> ChatAnthropic:
     return ChatAnthropic(
         model="claude-sonnet-4-6",
         temperature=0.2,
-        api_key=os.getenv("ANTHROPIC_API_KEY"),
     )
 
 

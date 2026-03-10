@@ -67,7 +67,6 @@ def _generate_faq(questions: List[str], primary_keyword: str) -> List[FAQItem]:
     llm = ChatAnthropic(
         model="claude-sonnet-4-6",
         temperature=0.3,
-        api_key=os.getenv("ANTHROPIC_API_KEY"),
     ).with_structured_output(FAQList)
 
     system = (
