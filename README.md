@@ -46,51 +46,65 @@ graph LR
 
 Nodes communicate exclusively through `ArticleState` (a LangGraph `TypedDict`). No node calls another node directly.
 
-| Node | Processing Type | State Inputs | State Outputs | LLM (model / temp) | Notes |
-|---|---|---|---|---|---|
-| `serp_fetch` | Rule-based | `topic`, `use_mock` | `serp_data` (top-10 results + People Also Ask) | — | Calls SerpAPI or returns hardcoded mock; mock contains 10 results + 5 PAA questions |
-| `analyze_serp` | LLM + structured output | `serp_data` (titles, URLs, snippets) | `serp_analysis` — `primary_keyword`, `secondary_keywords`, `common_subtopics`, `content_format`, `search_intent`, `competitor_h2_patterns` | claude-sonnet-4-6 / temp=0 | `with_structured_output(SerpAnalysis)`; keyword extraction folded here — no separate parse step |
-| `build_outline` | LLM + structured output | `serp_analysis`, `target_word_count`, `language` | `outline` — `h1_title`, `meta_title`, `meta_description`, per-section word budgets, `internal_links`, `external_references` | claude-sonnet-4-6 / temp=0.2 | Word budgets normalised to 93% of target (LLM overshoots by ~7%) |
-| `generate_sections` | LLM free-form | `outline` (heading, description, keywords, word budget per section), `serp_analysis` | `generated_sections` — `List[str]`, append reducer | claude-sonnet-4-6 / temp=0.7 | One LLM call per section; `Annotated[List[str], operator.add]` prevents overwrite on checkpoint replay |
-| `postprocess` | Rule-based assembly + LLM structured output | `outline`, `serp_analysis`, `generated_sections`, `serp_data` (for PAA) | `article_output` — full `ArticleOutput` with keyword analysis | claude-sonnet-4-6 / temp=0.3 (FAQ only) | Keyword density computed from `serp_analysis.primary_keyword`; FAQ via `with_structured_output(FAQList)` |
-| `validate_output` | Rule-based only (no LLM) | `article_output`, `outline`, `target_word_count` | `article_output` (with `validation_results` attached) | — | Regex + arithmetic; 10 deterministic SEO checks |
+| Node | Description | Notes |
+|---|---|---|
+| `serp_fetch` | Fetches top-10 Google SERP results and People Also Ask questions for the topic | **API call** (SerpAPI). Supports a built-in mock (10 results + 5 PAA questions) via `use_mock: true` — no API key needed. |
+| `analyze_serp` | Extracts primary keyword, secondary keywords, search intent, and competitor H2 patterns from SERP results | **LLM** (claude-sonnet-4-6, temp=0). Uses structured output (`SerpAnalysis`). Keyword extraction is folded in here — no separate parse step. |
+| `build_outline` | Produces the full article outline: H1, meta title, meta description, section headings, word budgets, internal links, and external references | **LLM** (claude-sonnet-4-6, temp=0.2). Uses structured output (`ArticleOutline`). Word budgets are scaled to 93% of target to account for LLM overshoot. |
+| `generate_sections` | Writes the body content for each section in the outline | **LLM** (claude-sonnet-4-6, temp=0.7). One call per section. Uses an append reducer (`operator.add`) so checkpoint replay accumulates rather than overwrites sections. |
+| `postprocess` | Assembles the full article body, computes keyword density, and generates FAQ items from PAA questions | **Rule-based** assembly + **LLM** for FAQ only (claude-sonnet-4-6, temp=0.3, structured output). |
+| `validate_output` | Runs 10 deterministic SEO checks and attaches results + overall score to the article | **Rule-based only** (regex + arithmetic). No LLM involved. |
 
 ---
 
 ## Architecture
 
+### LangGraph: Pipeline Orchestration and Shared State
+
+The pipeline is built on [LangGraph](https://github.com/langchain-ai/langgraph), a framework for authoring stateful, multi-step LLM workflows as directed graphs. Each of the six pipeline stages is an independent node — a plain Python function with no knowledge of any other node. All communication happens through a single shared state object (`ArticleState`), a typed dictionary that every node reads from and writes to. This gives the pipeline three important properties:
+
+- **Clean separation of concerns** — nodes are independently testable and replaceable without touching the rest of the graph.
+- **No implicit coupling** — adding, removing, or reordering a node requires only a change to `graph/builder.py`, not to any node's implementation.
+- **Transparent data flow** — `ArticleState` serves as the single source of truth; every field produced or consumed by a node is declared there.
+
+### LangGraph Checkpointing: Thread IDs, Polling, and Crash Recovery
+
+Every pipeline run is assigned a unique `thread_id`. LangGraph's `AsyncSqliteSaver` writes the full `ArticleState` to `checkpoints.db` after each node completes, keyed by this thread ID. This enables three capabilities that would otherwise require significant custom infrastructure:
+
+- **Job polling** — because each node completion is checkpointed, the application can read the latest checkpoint event to determine which stage the pipeline is currently at and surface that as `execution_stage` in the status API.
+- **Crash recovery** — if the server restarts or a node raises an unhandled exception mid-run, calling `POST /jobs/{thread_id}/resume` re-enters the graph at the last successfully completed node. LangGraph determines the resumption point automatically from the checkpoint — no manual state reconstruction needed.
+- **Idempotent replay** — the `generated_sections` field uses an append reducer (`Annotated[List[str], operator.add]`) rather than the default overwrite. On replay, already-generated sections accumulate rather than being lost, making the node safe to re-enter.
+
 ### Two SQLite Databases
 
-| Database | Owner | Purpose |
+Two databases are kept deliberately separate:
+
+| Database | Managed by | What it stores |
 |---|---|---|
-| `jobs.db` | Application | Tracks job status, execution stage, error messages, and stores the final `ArticleOutput` as a JSON blob in `result_json` |
-| `checkpoints.db` | LangGraph (`AsyncSqliteSaver`) | Persists full `ArticleState` after each node for crash recovery |
+| `checkpoints.db` | LangGraph (`AsyncSqliteSaver`) | Full `ArticleState` snapshots after each node — internal to LangGraph |
+| `jobs.db` | Application | Job status, current execution stage, error messages, and the final article as a JSON blob |
 
-These concerns are kept separate by design. The application queries `jobs.db` for everything it needs to serve API responses — it never reads LangGraph's internal checkpoint schema. On job completion, `run_graph()` deserialises the final state from the checkpoint once, serialises the result to JSON, and writes it to `jobs.db`. All subsequent `/result` calls read from `jobs.db` only.
+The application never reads LangGraph's internal checkpoint schema. On pipeline completion, the final state is serialised to JSON once and written to `jobs.db`. All subsequent status and result API calls read exclusively from `jobs.db`. This separation means the application layer is insulated from any changes to LangGraph's checkpoint format, and `jobs.db` can be queried, backed up, or replicated independently.
 
-### AsyncSqliteSaver (not SqliteSaver)
+### Rule-Based SEO Validation
 
-FastAPI runs a single async event loop. The synchronous `SqliteSaver` blocks that loop on every checkpoint write and is not thread-safe under concurrent requests. `AsyncSqliteSaver` uses `aiosqlite` internally and is designed for this context. The saver is held open for the application's lifetime via the FastAPI `lifespan` context manager (not the deprecated `@app.on_event` pattern).
+The final pipeline node (`validate_output`) runs 10 SEO checks using only regex and arithmetic — no LLM is involved. This is an intentional design choice: SEO constraints like meta title length, keyword density, and heading hierarchy are deterministic rules with clear pass/fail conditions. Delegating these checks to an LLM would introduce unnecessary non-determinism and risk hallucinated results (e.g., an LLM reporting a check as passed when it isn't). Rule-based validation gives:
 
-### `operator.add` Reducer on `generated_sections`
+- **Consistent, reproducible scores** — the same article always produces the same result.
+- **Cheap and fast checks** — no API calls, no latency, no cost.
+- **Auditable failures** — each check produces a specific detail message explaining exactly why it failed.
 
-LangGraph replays all nodes from the last successful checkpoint when a job is resumed. If `generated_sections` used the default overwrite reducer, a replayed `generate_sections` run would lose all previously written sections. Declaring it as `Annotated[List[str], operator.add]` makes the reducer append-only — replay accumulates sections rather than overwriting them, keeping the step idempotent. This also future-proofs the field for the revision loop extension point.
+These checks are also natural candidates for conversion into LLM tool calls in future iterations, where the LLM could use them to self-evaluate and revise its output.
 
-### 93% Word Budget Scaling
+### Extension: Automatic Revision Loop
 
-`build_outline_node` scales all section word budgets to 93% of `target_word_count` before writing them into the outline. Empirical testing showed Claude consistently overshoots per-section word count targets by approximately 7%. Correcting at outline time keeps the final word count inside the ±10% tolerance window that `validate_output` checks, without requiring post-hoc truncation.
+The current pipeline always runs `validate_output → END`. A natural extension is to make this conditional: if `overall_score` falls below a threshold, route back to `generate_sections` to revise the article before finalising. `graph/builder.py` contains a commented-out `add_conditional_edges` call that would enable this. The append reducer on `generated_sections` already makes re-entry into that node idempotent, so no state management changes would be required.
 
-### `parse_query` Not a Separate Node
+### Content Grounding via SERP Results
 
-Converting the user's natural-language topic into a clean search keyword is a single reasoning step. Folding it into `analyze_serp` saves one LLM call, one round-trip of latency, and one failure point. `primary_keyword` is part of `SerpAnalysis`'s structured output — produced in the same call that extracts subtopics, search intent, and competitor patterns.
+All content generation nodes (`build_outline`, `generate_sections`, `postprocess`) are grounded in real competitor data fetched in the first two nodes: `serp_fetch` pulls the top-10 Google results and People Also Ask questions for the topic, and `analyze_serp` distils these into a structured `SerpAnalysis` (primary keyword, secondary keywords, search intent, competitor H2 patterns) that flows through the rest of the pipeline. This avoids generating generic content disconnected from what actually ranks for the topic.
 
-### No Per-Section DDGS Search
-
-DuckDuckGo's scraper-based API has aggressive rate limiting and no guaranteed uptime. The SERP analysis already provides topic grounding via 10 real competitor results. Adding per-section DDGS would add ~10 seconds of latency per article, introduce a common failure mode, and require a complex mock path — for marginal content quality gain. Documented as an extension point.
-
-### Crash Recovery via the Resume Endpoint
-
-`POST /jobs/{thread_id}/resume` re-invokes `run_graph()` with the same `thread_id`. LangGraph looks up the checkpoint for that thread ID in `checkpoints.db`, determines the last successfully completed node, and resumes execution from there. No manual state reconstruction is required.
+The current SERP source is SerpAPI (with a built-in mock for development). This layer is isolated in `services/serp_client.py` and can be swapped for or supplemented by other sources — Tavily, Exa, or a direct Google Custom Search integration — without any changes to the pipeline nodes.
 
 ---
 
@@ -195,6 +209,20 @@ Both files are gitignored and should not be committed.
 
 ---
 
+## Live Demo
+
+A Jupyter notebook walkthrough is available at [`demo.ipynb`](demo.ipynb). It covers:
+
+- **Project structure** — annotated folder tree with descriptions of each component
+- **Pipeline diagram** — rendered Mermaid graph pulled directly from the compiled LangGraph
+- **Node reference** — table of all 6 nodes with roles and design notes
+- **Live run** — submits a real job to the running server, polls stage-by-stage with elapsed timings, and fetches the full result
+- **Results walkthrough** — inspects article content, keyword analysis, internal links, external references, FAQ, and the validation scorecard
+
+To run the notebook, start the server first (`uvicorn main:app --reload --port 8000` from `seo_agent/`), then open `demo.ipynb` and run all cells.
+
+---
+
 ## API Reference
 
 ### POST /jobs — Submit a Job
@@ -211,9 +239,9 @@ Accepts a topic and generation parameters. Returns a `thread_id` immediately (`2
 | `use_mock` | bool | `false` | Skip SerpAPI; use built-in mock SERP data |
 
 ```python
-import httpx
+import requests
 
-response = httpx.post(
+response = requests.post(
     "http://localhost:8000/jobs",
     json={
         "topic": "best productivity tools for remote teams",
@@ -246,12 +274,12 @@ Returns current job status and the name of the pipeline node that most recently 
 The `result_preview` field (first 300 characters of `body_markdown`) becomes populated after `postprocess` completes — useful for confirming the article is generating sensible content before the full result is ready.
 
 ```python
-import httpx, time
+import requests, time
 
 def poll_until_done(thread_id: str, interval: float = 5.0) -> dict:
     url = f"http://localhost:8000/jobs/{thread_id}"
     while True:
-        resp = httpx.get(url)
+        resp = requests.get(url)
         resp.raise_for_status()
         job = resp.json()
         print(f"  stage={job.get('execution_stage') or '—':25}  status={job['status']}")
@@ -283,9 +311,9 @@ Response example (mid-run):
 Returns the full `ArticleOutput` once `status` is `completed`. Returns `409 Conflict` if the job is still running or has failed.
 
 ```python
-import httpx
+import requests
 
-resp = httpx.get(f"http://localhost:8000/jobs/{thread_id}/result")
+resp = requests.get(f"http://localhost:8000/jobs/{thread_id}/result")
 resp.raise_for_status()   # raises 409 if not yet completed
 article = resp.json()
 
@@ -301,9 +329,9 @@ print(f"SEO score  : {article['validation_results']['overall_score']}/100")
 Re-enters the graph from the last LangGraph checkpoint. Valid for jobs with status `failed` or stale `running`. LangGraph determines the resumption point automatically from `checkpoints.db` — no configuration needed.
 
 ```python
-import httpx
+import requests
 
-resp = httpx.post(f"http://localhost:8000/jobs/{thread_id}/resume")
+resp = requests.post(f"http://localhost:8000/jobs/{thread_id}/resume")
 resp.raise_for_status()
 print(resp.json())   # {"thread_id": "...", "status": "running"}
 ```
@@ -313,13 +341,13 @@ print(resp.json())   # {"thread_id": "...", "status": "running"}
 ### End-to-End Example
 
 ```python
-import httpx, time
+import requests, time
 
 BASE = "http://localhost:8000"
 
 def generate_article(topic: str, word_count: int = 1500, use_mock: bool = True) -> dict:
     # 1. Submit job
-    resp = httpx.post(f"{BASE}/jobs", json={
+    resp = requests.post(f"{BASE}/jobs", json={
         "topic": topic,
         "target_word_count": word_count,
         "use_mock": use_mock,
@@ -330,7 +358,7 @@ def generate_article(topic: str, word_count: int = 1500, use_mock: bool = True) 
 
     # 2. Poll until done
     while True:
-        resp = httpx.get(f"{BASE}/jobs/{thread_id}")
+        resp = requests.get(f"{BASE}/jobs/{thread_id}")
         resp.raise_for_status()
         job = resp.json()
         print(f"  [{job.get('execution_stage') or '—'}]  {job['status']}")
@@ -341,7 +369,7 @@ def generate_article(topic: str, word_count: int = 1500, use_mock: bool = True) 
         time.sleep(5)
 
     # 3. Fetch result
-    resp = httpx.get(f"{BASE}/jobs/{thread_id}/result")
+    resp = requests.get(f"{BASE}/jobs/{thread_id}/result")
     resp.raise_for_status()
     return resp.json()
 
